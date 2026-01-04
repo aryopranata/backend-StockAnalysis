@@ -78,7 +78,11 @@ async function getStockData() {
                     await new Promise(resolve => setTimeout(resolve, 100));
                 }
             } catch (batchError) {
-                console.error(`Error fetching batch ${i + 1}:`, batchError.message);
+                if (batchError.message.includes('Too Many Requests') || (batchError.message.includes('Unexpected token') && batchError.message.includes('JSON'))) {
+                    console.error(`Error fetching batch ${i + 1}: Rate Limit Exceeded (Too Many Requests)`);
+                } else {
+                    console.error(`Error fetching batch ${i + 1}:`, batchError.message);
+                }
                 // Continue with other batches even if one fails
             }
         }
@@ -245,6 +249,16 @@ app.get('/api/stocks/:symbol', async (req, res) => {
             data: formattedData
         });
     } catch (error) {
+        // Check for Rate Limit / Too Many Requests error
+        // Yahoo Finance API sometimes returns "Too Many Requests" as plain text which causes JSON parse error
+        if (error.message.includes('Too Many Requests') || (error.message.includes('Unexpected token') && error.message.includes('JSON'))) {
+             return res.status(429).json({
+                success: false,
+                message: 'Terlalu banyak permintaan ke server data saham. Silakan coba beberapa saat lagi.',
+                error: 'Rate Limit Exceeded'
+            });
+        }
+
         res.status(404).json({
             success: false,
             message: 'Saham tidak ditemukan',
