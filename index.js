@@ -58,7 +58,7 @@ async function getStockData() {
         }
 
         // Fetch in batches to avoid timeouts
-        const batchSize = 50; // Fetch 50 stocks at a time
+        const batchSize = 10; // Reduced from 50 to 10 to avoid rate limits
         const batches = [];
         for (let i = 0; i < allStocks.length; i += batchSize) {
             batches.push(allStocks.slice(i, i + batchSize));
@@ -69,17 +69,40 @@ async function getStockData() {
         const allResults = [];
         for (let i = 0; i < batches.length; i++) {
             console.log(`Fetching batch ${i + 1}/${batches.length}...`);
-            try {
-                const batchResults = await yahooFinance.quote(batches[i]);
-                allResults.push(...batchResults);
-                console.log(`Batch ${i + 1} fetched: ${batchResults.length} stocks`);
-                // Small delay between batches to be respectful to the API
-                if (i < batches.length - 1) {
-                    await new Promise(resolve => setTimeout(resolve, 100));
+
+            let retries = 3;
+            let success = false;
+
+            while (retries > 0 && !success) {
+                try {
+                    const batchResults = await yahooFinance.quote(batches[i]);
+                    allResults.push(...batchResults);
+                    console.log(`Batch ${i + 1} fetched: ${batchResults.length} stocks`);
+                    success = true;
+
+                    // Increased delay between batches to be respectful to the API
+                    // Random delay between 2000ms and 4000ms
+                    if (i < batches.length - 1) {
+                        const delay = Math.floor(Math.random() * 2000) + 2000;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    }
+                } catch (batchError) {
+                    const isRateLimit = batchError.message.includes('Too Many Requests') ||
+                                      (batchError.message.includes('Unexpected token') && batchError.message.includes('JSON'));
+
+                    if (isRateLimit) {
+                        console.error(`Error fetching batch ${i + 1}: Rate Limit Exceeded. Retrying in 10s... (${retries} retries left)`);
+                        retries--;
+                        if (retries > 0) {
+                            await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10s before retry
+                        } else {
+                            console.error(`Failed to fetch batch ${i + 1} after retries.`);
+                        }
+                    } else {
+                        console.error(`Error fetching batch ${i + 1}:`, batchError.message);
+                        retries = 0; // Don't retry for other errors
+                    }
                 }
-            } catch (batchError) {
-                console.error(`Error fetching batch ${i + 1}:`, batchError.message);
-                // Continue with other batches even if one fails
             }
         }
 
@@ -245,6 +268,16 @@ app.get('/api/stocks/:symbol', async (req, res) => {
             data: formattedData
         });
     } catch (error) {
+        // Check for Rate Limit / Too Many Requests error
+        // Yahoo Finance API sometimes returns "Too Many Requests" as plain text which causes JSON parse error
+        if (error.message.includes('Too Many Requests') || (error.message.includes('Unexpected token') && error.message.includes('JSON'))) {
+             return res.status(429).json({
+                success: false,
+                message: 'Terlalu banyak permintaan ke server data saham. Silakan coba beberapa saat lagi.',
+                error: 'Rate Limit Exceeded'
+            });
+        }
+
         res.status(404).json({
             success: false,
             message: 'Saham tidak ditemukan',
