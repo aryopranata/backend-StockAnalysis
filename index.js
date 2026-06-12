@@ -8,6 +8,17 @@ const { parse } = require('csv-parse/sync');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+try {
+    yahooFinance.setGlobalConfig({
+        validation: {
+            logErrors: false,
+            logOptionsErrors: false
+        }
+    });
+} catch (error) {
+    console.warn('[YAHOO] Global config not applied:', error.message);
+}
+
 const QUOTE_FIELDS = [
     'symbol',
     'shortName',
