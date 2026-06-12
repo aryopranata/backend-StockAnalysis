@@ -45,17 +45,25 @@ const QUOTE_FIELDS = [
     'exchangeName'
 ];
 
-const YF_BATCH_SIZE = Number(process.env.YF_BATCH_SIZE || 8);
-const YF_REQUEST_DELAY_MS = Number(process.env.YF_REQUEST_DELAY_MS || 150);
-const YF_QUOTE_TIMEOUT_MS = Number(process.env.YF_QUOTE_TIMEOUT_MS || 8000);
-const STOCK_FETCH_TIMEOUT_MS = Number(process.env.STOCK_FETCH_TIMEOUT_MS || 25000);
+// Vercel/serverless must finish quickly. Use Yahoo bulk quote first, then split only failed batches.
+const YF_BATCH_SIZE = Number(process.env.YF_BATCH_SIZE || 25);
+const YF_REQUEST_DELAY_MS = Number(process.env.YF_REQUEST_DELAY_MS || 50);
+const YF_SINGLE_QUOTE_TIMEOUT_MS = Number(process.env.YF_SINGLE_QUOTE_TIMEOUT_MS || 7000);
+const YF_BATCH_QUOTE_TIMEOUT_MS = Number(process.env.YF_BATCH_QUOTE_TIMEOUT_MS || 12000);
+const STOCK_FETCH_TIMEOUT_MS = Number(process.env.STOCK_FETCH_TIMEOUT_MS || 45000);
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, timeoutMs, message) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(message)), timeoutMs))
+    ]);
 }
 
 function normalizeSymbol(rawSymbol) {
@@ -111,7 +119,7 @@ function formatStock(stock, includeFullData = false) {
     return formatted;
 }
 
-async function fetchQuoteWithTimeout(symbol, attempts = 2) {
+async function fetchSingleQuote(symbol, attempts = 2) {
     let lastError;
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -121,27 +129,72 @@ async function fetchQuoteWithTimeout(symbol, attempts = 2) {
                 { fields: QUOTE_FIELDS },
                 { validateResult: false }
             );
-            const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => reject(new Error(`Yahoo Finance timeout for ${symbol}`)), YF_QUOTE_TIMEOUT_MS);
-            });
 
-            const stock = await Promise.race([quotePromise, timeoutPromise]);
+            const stock = await withTimeout(
+                quotePromise,
+                YF_SINGLE_QUOTE_TIMEOUT_MS,
+                `Yahoo Finance timeout for ${symbol}`
+            );
+
             if (!stock || !stock.symbol) {
                 throw new Error(`Yahoo Finance returned empty data for ${symbol}`);
             }
+
             return stock;
         } catch (error) {
             lastError = error;
-            if (attempt < attempts) {
-                await sleep(300 * attempt);
-            }
+            if (attempt < attempts) await sleep(250 * attempt);
         }
     }
 
     throw lastError;
 }
 
-// Fungsi untuk mengambil semua kode saham dari file lokal
+async function fetchQuoteBatch(symbols, depth = 0) {
+    const cleanedSymbols = [...new Set((symbols || []).map(normalizeSymbol).filter(Boolean))];
+    if (cleanedSymbols.length === 0) return [];
+
+    if (cleanedSymbols.length === 1) {
+        try {
+            return [await fetchSingleQuote(cleanedSymbols[0])];
+        } catch (error) {
+            console.error(`[YAHOO] Failed single ${cleanedSymbols[0]}:`, error.message);
+            return [];
+        }
+    }
+
+    try {
+        const quotePromise = yahooFinance.quote(
+            cleanedSymbols,
+            { fields: QUOTE_FIELDS },
+            { validateResult: false }
+        );
+
+        const result = await withTimeout(
+            quotePromise,
+            YF_BATCH_QUOTE_TIMEOUT_MS,
+            `Yahoo Finance batch timeout for ${cleanedSymbols.length} symbols`
+        );
+
+        const quotes = Array.isArray(result) ? result : [result];
+        return quotes.filter(quote => quote && quote.symbol);
+    } catch (error) {
+        console.warn(`[YAHOO] Batch failed at depth ${depth} (${cleanedSymbols.length} symbols):`, error.message);
+
+        // Split failed batch so one broken ticker does not kill the whole endpoint.
+        const mid = Math.ceil(cleanedSymbols.length / 2);
+        const left = cleanedSymbols.slice(0, mid);
+        const right = cleanedSymbols.slice(mid);
+
+        const [leftQuotes, rightQuotes] = await Promise.all([
+            fetchQuoteBatch(left, depth + 1),
+            fetchQuoteBatch(right, depth + 1)
+        ]);
+
+        return [...leftQuotes, ...rightQuotes];
+    }
+}
+
 function getAllIDXStockCodes() {
     try {
         const candidates = [
@@ -150,14 +203,7 @@ function getAllIDXStockCodes() {
             path.resolve('resource', 'stockcode.csv')
         ];
 
-        let csvPathFound = null;
-        for (const p of candidates) {
-            if (fs.existsSync(p)) {
-                csvPathFound = p;
-                break;
-            }
-        }
-
+        const csvPathFound = candidates.find(p => fs.existsSync(p));
         if (!csvPathFound) {
             throw new Error(`stockcode.csv not found in any candidate paths: ${candidates.join(', ')}`);
         }
@@ -165,30 +211,26 @@ function getAllIDXStockCodes() {
         console.log('CSV Path found:', csvPathFound);
         const csvText = fs.readFileSync(csvPathFound, 'utf8');
         const records = parse(csvText, { columns: true, skip_empty_lines: true });
-        const symbols = records
-            .map(rec => normalizeSymbol(rec.Code))
-            .filter(Boolean);
-
+        const symbols = records.map(rec => normalizeSymbol(rec.Code)).filter(Boolean);
         const uniqueSymbols = [...new Set(symbols)];
+
         console.log('Records loaded:', records.length, 'Unique symbols:', uniqueSymbols.length);
         return uniqueSymbols;
     } catch (error) {
-        console.error('Error reading CSV:', error && error.message ? error.message : error);
+        console.error('Error reading CSV:', error.message || error);
         return [];
     }
 }
 
-// Fungsi untuk mengambil data saham dengan fetching yang tahan error Yahoo Finance
-async function getStockData() {
+async function getStockData(symbolsOverride = null) {
     try {
         console.log('Mengambil data saham dari Yahoo Finance...');
-        const allStocks = getAllIDXStockCodes();
-        console.log('All IDX_STOCKS count:', allStocks.length);
+        const allStocks = symbolsOverride && symbolsOverride.length
+            ? symbolsOverride.map(normalizeSymbol).filter(Boolean)
+            : getAllIDXStockCodes();
 
-        if (allStocks.length === 0) {
-            console.error('No stock codes loaded from CSV');
-            return [];
-        }
+        console.log('All IDX_STOCKS count:', allStocks.length);
+        if (allStocks.length === 0) return [];
 
         const batchSize = Math.max(1, YF_BATCH_SIZE);
         const batches = [];
@@ -196,43 +238,27 @@ async function getStockData() {
             batches.push(allStocks.slice(i, i + batchSize));
         }
 
-        console.log(`Fetching ${allStocks.length} symbols in ${batches.length} batches of up to ${batchSize}`);
+        console.log(`Fetching ${allStocks.length} symbols in ${batches.length} Yahoo bulk batches`);
 
         const allResults = [];
-        const failedSymbols = [];
-
         for (let i = 0; i < batches.length; i++) {
             const batch = batches[i];
             console.log(`Fetching batch ${i + 1}/${batches.length}: ${batch.join(', ')}`);
 
-            const settled = await Promise.allSettled(batch.map(symbol => fetchQuoteWithTimeout(symbol)));
-
-            settled.forEach((result, index) => {
-                const symbol = batch[index];
-                if (result.status === 'fulfilled') {
-                    const formatted = formatStock(result.value);
-                    if (formatted && formatted.price > 0) {
-                        allResults.push(formatted);
-                    } else {
-                        failedSymbols.push({ symbol, error: 'Invalid or zero price returned' });
-                    }
-                } else {
-                    failedSymbols.push({ symbol, error: result.reason?.message || String(result.reason) });
-                    console.error(`[YAHOO] Failed ${symbol}:`, result.reason?.message || result.reason);
+            const quotes = await fetchQuoteBatch(batch);
+            for (const quote of quotes) {
+                const formatted = formatStock(quote);
+                if (formatted && formatted.price > 0) {
+                    allResults.push(formatted);
                 }
-            });
-
-            if (i < batches.length - 1) {
-                await sleep(YF_REQUEST_DELAY_MS);
             }
+
+            if (i < batches.length - 1) await sleep(YF_REQUEST_DELAY_MS);
         }
 
-        console.log('Total formatted results count:', allResults.length);
-        if (failedSymbols.length > 0) {
-            console.warn(`[YAHOO] ${failedSymbols.length} symbols failed:`, failedSymbols.slice(0, 10));
-        }
-
-        return allResults;
+        const deduped = [...new Map(allResults.map(stock => [stock.symbol, stock])).values()];
+        console.log('Total formatted results count:', deduped.length);
+        return deduped;
     } catch (error) {
         console.error('Error fetching data:', error.message);
         console.error('Error stack:', error.stack);
@@ -240,14 +266,10 @@ async function getStockData() {
     }
 }
 
-// Tambahkan cache dan waktu update
 let cachedStocks = [];
 let lastUpdate = null;
-
-// Detect serverless environment (Vercel/Now)
 const isServerless = !!process.env.VERCEL || !!process.env.NOW_REGION || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
 
-// Fungsi untuk refresh cache
 async function refreshStockCache() {
     try {
         const nextStocks = await getStockData();
@@ -263,7 +285,6 @@ async function refreshStockCache() {
     }
 }
 
-// Refresh pertama saat server start
 if (!isServerless) {
     refreshStockCache();
     setInterval(refreshStockCache, 60 * 1000);
@@ -271,7 +292,6 @@ if (!isServerless) {
     console.log('[INFO] Running in serverless mode — cache will be refreshed per-request');
 }
 
-// Routes
 app.get('/', (req, res) => {
     res.json({
         message: 'IDX Stock Market API',
@@ -280,41 +300,46 @@ app.get('/', (req, res) => {
             singleStock: '/api/stocks/:symbol',
             marketSummary: '/api/summary',
             health: '/api/health',
-            debugCsv: '/api/debug/csv'
+            debugCsv: '/api/debug/csv',
+            debugYahoo: '/api/debug/yahoo/:symbol'
         },
         documentation: 'Gunakan endpoint di atas untuk mendapatkan data saham IDX'
     });
 });
 
-// Get all stocks
 app.get('/api/stocks', async (req, res) => {
     try {
+        const requestedSymbols = req.query.symbols
+            ? String(req.query.symbols).split(',').map(s => s.trim()).filter(Boolean)
+            : null;
+
+        const requestedLimit = Number(req.query.limit || 0);
+        const sourceSymbols = requestedSymbols || getAllIDXStockCodes();
+        const symbolsToFetch = requestedLimit > 0 ? sourceSymbols.slice(0, requestedLimit) : sourceSymbols;
+
         if (isServerless) {
             console.log('[API] Serverless request — fetching stock data on-demand');
             try {
-                const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Fetch timeout')), STOCK_FETCH_TIMEOUT_MS));
-                const data = await Promise.race([getStockData(), timeoutPromise]);
+                const data = await withTimeout(
+                    getStockData(symbolsToFetch),
+                    STOCK_FETCH_TIMEOUT_MS,
+                    'Fetch timeout'
+                );
 
-                if (!data.length && cachedStocks.length > 0) {
-                    return res.json({
-                        success: true,
-                        stale: true,
-                        count: cachedStocks.length,
-                        data: cachedStocks,
-                        lastUpdate,
-                        timestamp: new Date().toISOString(),
-                        message: 'Yahoo Finance returned no fresh data; stale cache returned.'
-                    });
-                }
-
-                if (data.length > 0) {
+                if (data.length > 0 && !requestedSymbols && !requestedLimit) {
                     cachedStocks = data;
                     lastUpdate = new Date();
                 }
 
-                return res.json({ success: true, count: data.length, data, lastUpdate: new Date().toISOString(), timestamp: new Date().toISOString() });
+                return res.json({
+                    success: true,
+                    count: data.length,
+                    data,
+                    lastUpdate: new Date().toISOString(),
+                    timestamp: new Date().toISOString()
+                });
             } catch (err) {
-                console.error('[API] On-demand fetch failed:', err && err.message ? err.message : err);
+                console.error('[API] On-demand fetch failed:', err.message || err);
 
                 if (cachedStocks.length > 0) {
                     return res.json({
@@ -328,7 +353,11 @@ app.get('/api/stocks', async (req, res) => {
                     });
                 }
 
-                return res.status(502).json({ success: false, message: 'Failed to fetch stock data from Yahoo Finance', error: err.message || String(err) });
+                return res.status(502).json({
+                    success: false,
+                    message: 'Failed to fetch stock data from Yahoo Finance',
+                    error: err.message || String(err)
+                });
             }
         }
 
@@ -336,15 +365,17 @@ app.get('/api/stocks', async (req, res) => {
         const isCacheEmpty = cachedStocks.length === 0;
         const isCacheStale = lastUpdate && (now - lastUpdate) > 5 * 60 * 1000;
 
+        if (requestedSymbols || requestedLimit) {
+            const data = await getStockData(symbolsToFetch);
+            return res.json({ success: true, count: data.length, data, lastUpdate: new Date().toISOString(), timestamp: new Date().toISOString() });
+        }
+
         if (isCacheEmpty || isCacheStale) {
             console.log('[API] Cache is empty or stale, refreshing...');
-            const refreshPromise = refreshStockCache();
-            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Refresh timeout')), 15000));
-
             try {
-                await Promise.race([refreshPromise, timeoutPromise]);
+                await withTimeout(refreshStockCache(), 20000, 'Refresh timeout');
             } catch (refreshError) {
-                console.error('[API] Refresh failed or timed out:', refreshError && refreshError.message ? refreshError.message : refreshError);
+                console.error('[API] Refresh failed or timed out:', refreshError.message || refreshError);
             }
         }
 
@@ -359,7 +390,6 @@ app.get('/api/stocks', async (req, res) => {
     }
 });
 
-// Diagnostic endpoint to check CSV reading on the deployed environment
 app.get('/api/debug/csv', (req, res) => {
     try {
         const candidates = [
@@ -375,11 +405,20 @@ app.get('/api/debug/csv', (req, res) => {
         const records = parse(csvText, { columns: true, skip_empty_lines: true });
         res.json({ success: true, path: found, count: records.length, sample: records.slice(0, 5), symbols: getAllIDXStockCodes().slice(0, 10) });
     } catch (err) {
-        res.status(500).json({ success: false, error: err && err.message ? err.message : String(err) });
+        res.status(500).json({ success: false, error: err.message || String(err) });
     }
 });
 
-// Get single stock by symbol
+app.get('/api/debug/yahoo/:symbol', async (req, res) => {
+    try {
+        const formattedSymbol = normalizeSymbol(req.params.symbol);
+        const quote = await fetchSingleQuote(formattedSymbol);
+        res.json({ success: true, symbol: formattedSymbol, data: formatStock(quote, true) });
+    } catch (error) {
+        res.status(502).json({ success: false, symbol: normalizeSymbol(req.params.symbol), error: error.message || String(error) });
+    }
+});
+
 app.get('/api/stocks/:symbol', async (req, res) => {
     try {
         const formattedSymbol = normalizeSymbol(req.params.symbol);
@@ -387,17 +426,14 @@ app.get('/api/stocks/:symbol', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Symbol tidak valid' });
         }
 
-        const stock = await fetchQuoteWithTimeout(formattedSymbol);
+        const stock = await fetchSingleQuote(formattedSymbol);
         const formattedData = formatStock(stock, true);
 
         if (!formattedData || formattedData.price <= 0) {
             return res.status(404).json({ success: false, message: 'Saham tidak ditemukan atau harga kosong', symbol: formattedSymbol });
         }
 
-        res.json({
-            success: true,
-            data: formattedData
-        });
+        res.json({ success: true, data: formattedData });
     } catch (error) {
         console.error(`[API] Error in /api/stocks/${req.params.symbol}:`, error.message);
         res.status(404).json({
@@ -408,7 +444,6 @@ app.get('/api/stocks/:symbol', async (req, res) => {
     }
 });
 
-// Get market summary
 app.get('/api/summary', (req, res) => {
     const stocks = cachedStocks;
     const summary = {
@@ -417,23 +452,15 @@ app.get('/api/summary', (req, res) => {
         gainers: stocks.filter(stock => stock.change > 0).length,
         losers: stocks.filter(stock => stock.change < 0).length,
         unchanged: stocks.filter(stock => stock.change === 0).length,
-        topGainers: stocks.filter(stock => stock.change > 0)
-                        .sort((a, b) => b.changePercent - a.changePercent)
-                        .slice(0, 5),
-        topLosers: stocks.filter(stock => stock.change < 0)
-                        .sort((a, b) => a.changePercent - b.changePercent)
-                        .slice(0, 5),
+        topGainers: stocks.filter(stock => stock.change > 0).sort((a, b) => b.changePercent - a.changePercent).slice(0, 5),
+        topLosers: stocks.filter(stock => stock.change < 0).sort((a, b) => a.changePercent - b.changePercent).slice(0, 5),
         mostActive: stocks.slice().sort((a, b) => b.volume - a.volume).slice(0, 5),
         lastUpdate,
         timestamp: new Date().toISOString()
     };
-    res.json({
-        success: true,
-        data: summary
-    });
+    res.json({ success: true, data: summary });
 });
 
-// Health check endpoint
 app.get('/api/health', (req, res) => {
     res.json({
         status: 'OK',
@@ -441,11 +468,15 @@ app.get('/api/health', (req, res) => {
         uptime: process.uptime(),
         cachedStocks: cachedStocks.length,
         lastUpdate,
-        isServerless
+        isServerless,
+        config: {
+            YF_BATCH_SIZE,
+            YF_BATCH_QUOTE_TIMEOUT_MS,
+            STOCK_FETCH_TIMEOUT_MS
+        }
     });
 });
 
-// Error handling middleware
 app.use((error, req, res, next) => {
     console.error(error.stack);
     res.status(500).json({
@@ -455,7 +486,6 @@ app.use((error, req, res, next) => {
     });
 });
 
-// 404 handler
 app.use('*', (req, res) => {
     res.status(404).json({
         success: false,
@@ -463,7 +493,6 @@ app.use('*', (req, res) => {
     });
 });
 
-// Start server
 app.listen(PORT, () => {
     console.log(`🚀 Server berjalan di http://localhost:${PORT}`);
     console.log('📊 API Stock IDX siap digunakan');
