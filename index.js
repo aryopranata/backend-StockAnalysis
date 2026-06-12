@@ -8,17 +8,6 @@ const { parse } = require('csv-parse/sync');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-try {
-    yahooFinance.setGlobalConfig({
-        validation: {
-            logErrors: false,
-            logOptionsErrors: false
-        }
-    });
-} catch (error) {
-    console.warn('[YAHOO] Global config not applied:', error.message);
-}
-
 const QUOTE_FIELDS = [
     'symbol',
     'shortName',
@@ -128,7 +117,7 @@ async function fetchSingleQuote(symbol, attempts = 2) {
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
         try {
-            const quotePromise = yahooFinance.quote(symbol, { fields: QUOTE_FIELDS }, { validateResult: false });
+            const quotePromise = yahooFinance.quote(symbol);
             const stock = await withTimeout(quotePromise, YF_SINGLE_QUOTE_TIMEOUT_MS, `Yahoo Finance timeout for ${symbol}`);
 
             if (!stock || !stock.symbol) throw new Error(`Yahoo Finance returned empty data for ${symbol}`);
@@ -156,7 +145,7 @@ async function fetchQuoteBatch(symbols, depth = 0) {
     }
 
     try {
-        const quotePromise = yahooFinance.quote(cleanedSymbols, { fields: QUOTE_FIELDS }, { validateResult: false });
+        const quotePromise = yahooFinance.quote(cleanedSymbols);
         const result = await withTimeout(quotePromise, YF_BATCH_QUOTE_TIMEOUT_MS, `Yahoo Finance batch timeout for ${cleanedSymbols.length} symbols`);
         const quotes = Array.isArray(result) ? result : [result];
         return quotes.filter(quote => quote && quote.symbol);
